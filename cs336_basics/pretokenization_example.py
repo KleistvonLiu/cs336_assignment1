@@ -2,6 +2,13 @@ import os
 from typing import BinaryIO
 
 
+"""
+按照期望的数字根据sepcial token寻找chunk
+先根据期望数量找到等分的位置，
+从第一个等分位置开始找分隔符，
+如果没有的话最后的输出只有一个chunk，
+如果有的话就跳到下一个等分位置，不用担心重复，最后会去重
+"""
 def find_chunk_boundaries(
     file: BinaryIO,
     desired_num_chunks: int,
@@ -50,13 +57,13 @@ def find_chunk_boundaries(
 
 
 ## Usage
-with open(..., "rb") as f:
-    num_processes = 4
-    boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
-
-    # The following is a serial implementation, but you can parallelize this
-    # by sending each start/end pair to a set of processes.
-    for start, end in zip(boundaries[:-1], boundaries[1:]):
-        f.seek(start)
-        chunk = f.read(end - start).decode("utf-8", errors="ignore")
-        # Run pre-tokenization on your chunk and store the counts for each pre-token
+# with open(..., "rb") as f:
+#     num_processes = 4
+#     boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
+#
+#     # The following is a serial implementation, but you can parallelize this
+#     # by sending each start/end pair to a set of processes.
+#     for start, end in zip(boundaries[:-1], boundaries[1:]):
+#         f.seek(start)
+#         chunk = f.read(end - start).decode("utf-8", errors="ignore")
+#         # Run pre-tokenization on your chunk and store the counts for each pre-token
