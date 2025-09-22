@@ -81,7 +81,6 @@ def find_chunk_boundaries(
     file.seek(0, os.SEEK_END)
     file_size = file.tell()
     file.seek(0)
-
     if desired_num_chunks <= 1 or file_size == 0:
         return [0, file_size]
 
@@ -388,3 +387,5 @@ def train_bpe(
         next_id += 1
 
     return vocab, merges
+
+
