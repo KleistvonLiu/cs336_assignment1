@@ -9,8 +9,13 @@ import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
+from tests.positionwise_feedforward import SwiGLU
+from tests.rope import RotaryPositionalEmbedding
 from tests.tokenizer import Tokenizer
 from tests.train_bpe import train_bpe
+from tests.linear import Linear
+from tests.embedding import Embedding
+from tests.rmsnorm import RMSNorm
 
 
 def run_linear(
@@ -21,40 +26,61 @@ def run_linear(
 ) -> Float[Tensor, " ... d_out"]:
     """
     Given the weights of a Linear layer, compute the transformation of a batched input.
-
-    Args:
-        in_dim (int): The size of the input dimension
-        out_dim (int): The size of the output dimension
-        weights (Float[Tensor, "d_out d_in"]): The linear weights to use
-        in_features (Float[Tensor, "... d_in"]): The output tensor to apply the function to
-
-    Returns:
-        Float[Tensor, "... d_out"]: The transformed output of your linear module.
+    Loads the provided weights into your bias-free Linear and runs a forward pass.
     """
+    # 1) 设备/精度对齐
+    if not isinstance(weights, torch.Tensor):
+        W = torch.as_tensor(weights, device=in_features.device, dtype=in_features.dtype)
+    else:
+        W = weights.to(device=in_features.device, dtype=in_features.dtype)
 
-    raise NotImplementedError
+    # 2) 基本校验
+    assert W.shape == (d_out, d_in), f"weights shape {W.shape} != ({d_out}, {d_in})"
+    assert in_features.shape[-1] == d_in, f"in_features last dim {in_features.shape[-1]} != {d_in}"
+
+    # 3) 构造自定义 Linear，并加载权重（参数名必须是 'W'）
+    layer = Linear(in_features=d_in, out_features=d_out,
+                   device=in_features.device, dtype=in_features.dtype)
+    layer.load_state_dict({"W": W}, strict=True)
+
+    # 4) 前向计算
+    layer.eval() # 開啓評估模式，影響dropout和normalization等
+    with torch.no_grad():
+        return layer(in_features)
 
 
 def run_embedding(
     vocab_size: int,
     d_model: int,
-    weights: Float[Tensor, " vocab_size d_model"],
+    weights: Float[Tensor, " vocab_size d_model"] | "numpy.ndarray",
     token_ids: Int[Tensor, " ..."],
 ) -> Float[Tensor, " ... d_model"]:
     """
     Given the weights of an Embedding layer, get the embeddings for a batch of token ids.
-
-    Args:
-        vocab_size (int): The number of embeddings in the vocabulary
-        d_model (int): The size of the embedding dimension
-        weights (Float[Tensor, "vocab_size d_model"]): The embedding vectors to fetch from
-        token_ids (Int[Tensor, "..."]): The set of token ids to fetch from the Embedding layer
-
-    Returns:
-        Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
+    # 1) 设备/精度对齐
+    if not isinstance(weights, torch.Tensor):
+        W = torch.as_tensor(weights)
+    else:
+        W = weights
+    W = W.to(device=token_ids.device)
 
-    raise NotImplementedError
+    # 2) 基本形状校验
+    assert W.shape == (vocab_size, d_model), f"weights shape {W.shape} != ({vocab_size}, {d_model})"
+
+    # 3) 构造自定义 Embedding 并加载权重（参数名必须是 "weight"）
+    emb = Embedding(
+        num_embeddings=vocab_size,
+        embedding_dim=d_model,
+        device=token_ids.device,
+        dtype=W.dtype,
+    )
+    emb.load_state_dict({"weight": W}, strict=True)
+
+    # 4) 前向计算
+    emb.eval()
+    with torch.no_grad():
+        return emb(token_ids)
 
 
 def run_swiglu(
@@ -65,28 +91,26 @@ def run_swiglu(
     w3_weight: Float[Tensor, " d_ff d_model"],
     in_features: Float[Tensor, " ... d_model"],
 ) -> Float[Tensor, " ... d_model"]:
-    """Given the weights of a SwiGLU network, return
-    the output of your implementation with these weights.
+    """Given the weights of a SwiGLU network, return the output of your implementation with these weights."""
+    dev, dt = in_features.device, in_features.dtype
 
-    Args:
-        d_model (int): Dimensionality of the feedforward input and output.
-        d_ff (int): Dimensionality of the up-project happening internally to your swiglu.
-        w1_weight (Float[Tensor, "d_ff d_model"]): Stored weights for W1
-        w2_weight (Float[Tensor, "d_model d_ff"]): Stored weights for W2
-        w3_weight (Float[Tensor, "d_ff d_model"]): Stored weights for W3
-        in_features (Float[Tensor, "... d_model"]): Input embeddings to the feed-forward layer.
+    # to() 确保 device/dtype 对齐
+    W1 = torch.as_tensor(w1_weight, device=dev, dtype=dt)
+    W2 = torch.as_tensor(w2_weight, device=dev, dtype=dt)
+    W3 = torch.as_tensor(w3_weight, device=dev, dtype=dt)
 
-    Returns:
-        Float[Tensor, "... d_model"]: Output embeddings of the same shape as the input embeddings.
-    """
-    # Example:
-    # If your state dict keys match, you can use `load_state_dict()`
-    # swiglu.load_state_dict(weights)
-    # You can also manually assign the weights
-    # swiglu.w1.weight.data = w1_weight
-    # swiglu.w2.weight.data = w2_weight
-    # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    # 形状校验
+    assert W1.shape == (d_ff, d_model), f"W1 shape {W1.shape} != {(d_ff, d_model)}"
+    assert W3.shape == (d_ff, d_model), f"W3 shape {W3.shape} != {(d_ff, d_model)}"
+    assert W2.shape == (d_model, d_ff), f"W2 shape {W2.shape} != {(d_model, d_ff)}"
+
+    # 构造模块并加载权重（注意：我们的 Linear 参数名是 "W"）
+    swiglu = SwiGLU(d_model=d_model, d_ff=d_ff, device=dev, dtype=dt)
+    swiglu.load_state_dict({"w1.W": W1, "w2.W": W2, "w3.W": W3}, strict=True)
+
+    swiglu.eval()
+    with torch.no_grad():
+        return swiglu(in_features)
 
 
 def run_scaled_dot_product_attention(
@@ -193,17 +217,11 @@ def run_rope(
 ) -> Float[Tensor, " ... sequence_length d_k"]:
     """
     Run RoPE for a given input tensor.
-
-    Args:
-        d_k (int): Embedding dimension size for the query or key tensor.
-        theta (float): RoPE parameter.
-        max_seq_len (int): Maximum sequence length to pre-cache if your implementation does that.
-        in_query_or_key (Float[Tensor, "... sequence_length d_k"]): Input tensor to run RoPE on.
-        token_positions (Int[Tensor, "... sequence_length"]): Tensor of shape (batch_size, sequence_length) with the token positions
-    Returns:
-        Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    rope = RotaryPositionalEmbedding(theta=theta, d_k=d_k, max_seq_len=max_seq_len, device=in_query_or_key.device)
+    rope.eval()
+    with torch.no_grad():
+        return rope(in_query_or_key, token_positions.to(device=in_query_or_key.device, dtype=torch.long))
 
 
 def run_transformer_block(
@@ -364,24 +382,28 @@ def run_transformer_lm(
 def run_rmsnorm(
     d_model: int,
     eps: float,
-    weights: Float[Tensor, " d_model"],
+    weights: Float[Tensor, " d_model"] | "numpy.ndarray",
     in_features: Float[Tensor, " ... d_model"],
 ) -> Float[Tensor, " ... d_model"]:
-    """Given the weights of a RMSNorm affine transform,
-    return the output of running RMSNorm on the input features.
-
-    Args:
-        d_model (int): The dimensionality of the RMSNorm input.
-        eps: (float): A value added to the denominator for numerical stability.
-        weights (Float[Tensor, "d_model"]): RMSNorm weights.
-        in_features (Float[Tensor, "... d_model"]): Input features to run RMSNorm on. Can have arbitrary leading
-            dimensions.
-
-    Returns:
-        Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
-        RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+    Given the weights of a RMSNorm affine transform,
+    return the output of running RMSNorm on the input features.
+    """
+    # 设备/精度对齐
+    if not isinstance(weights, torch.Tensor):
+        gamma = torch.as_tensor(weights, device=in_features.device, dtype=in_features.dtype)
+    else:
+        gamma = weights.to(device=in_features.device, dtype=in_features.dtype)
+
+    assert gamma.shape == (d_model,), f"weights shape {gamma.shape} != ({d_model},)"
+
+    # 构造并加载权重（参数名必须是 "weight"）
+    layer = RMSNorm(d_model=d_model, eps=eps, device=in_features.device, dtype=gamma.dtype)
+    layer.load_state_dict({"weight": gamma}, strict=True)
+
+    layer.eval()
+    with torch.no_grad():
+        return layer(in_features)
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
