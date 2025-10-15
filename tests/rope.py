@@ -33,6 +33,7 @@ class RotaryPositionalEmbedding(nn.Module):
         # inv_freq_i = theta^(-2i/d_k) == theta^(-i/(d_k/2))
         i = torch.arange(half, device=device, dtype=torch.float32)
         inv_freq = self.theta ** (-i / half)  # (half,)
+        # inv_freq = self.theta ** (-(2*i+1) / d_k) ## 为啥会报错啊？
 
         # Positions 0..max_seq_len-1
         pos = torch.arange(self.max_seq_len, device=device, dtype=torch.float32)  # (L,)
@@ -55,7 +56,7 @@ class RotaryPositionalEmbedding(nn.Module):
         if x.shape[-1] != self.d_k:
             raise ValueError(f"Last dim of x must be d_k={self.d_k}, got {x.shape[-1]}")
 
-        # 基本形状
+        # 基本形状，x 形状 (..., L, d_k)，token_positions 形状可以是 (..., L) 或仅 (L,)。
         B = x.shape[:-2]  # 任意批维
         L = x.shape[-2]  # seq_len
 
