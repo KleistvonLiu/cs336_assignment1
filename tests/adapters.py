@@ -21,7 +21,8 @@ from tests.embedding import Embedding
 from tests.rmsnorm import RMSNorm
 from tests.transformer_block import TransformerBlock
 from tests.transformer_lm import TransformerLM
-
+from .cross_entrophy import cross_entropy_stable
+from .adamw import AdamWFromScratch
 
 def run_linear(
     d_in: int,
@@ -693,7 +694,7 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    return cross_entropy_stable(inputs, targets)
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
@@ -712,8 +713,7 @@ def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
-
+    return AdamWFromScratch
 
 def run_get_lr_cosine_schedule(
     it: int,
