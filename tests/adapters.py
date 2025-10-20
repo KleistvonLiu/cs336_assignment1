@@ -2,20 +2,25 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable
-from typing import IO, Any, BinaryIO
+from typing import IO, Any, BinaryIO, Dict
 
 import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
+from tests.attention import scaled_dot_product_attention
+from tests.multi_head_self_attention import MultiheadSelfAttention
 from tests.positionwise_feedforward import SwiGLU
 from tests.rope import RotaryPositionalEmbedding
+from tests.softmax_stable import softmax_stable
 from tests.tokenizer import Tokenizer
 from tests.train_bpe import train_bpe
 from tests.linear import Linear
 from tests.embedding import Embedding
 from tests.rmsnorm import RMSNorm
+from tests.transformer_block import TransformerBlock
+from tests.transformer_lm import TransformerLM
 
 
 def run_linear(
@@ -120,18 +125,14 @@ def run_scaled_dot_product_attention(
     mask: Bool[Tensor, " ... queries keys"] | None = None,
 ) -> Float[Tensor, " ... queries d_v"]:
     """
-    Given key (K), query (Q), and value (V) tensors, return
-    the output of your scaled dot product attention implementation.
-
-    Args:
-        Q (Float[Tensor, " ... queries d_k"]): Query tensor
-        K (Float[Tensor, " ... keys d_k"]): Key tensor
-        V (Float[Tensor, " ... values d_v"]): Values tensor
-        mask (Bool[Tensor, " ... queries keys"] | None): Mask tensor
-    Returns:
-        Float[Tensor, " ... queries d_v"]: Output of SDPA
+    Adapter: call your SDPA implementation. Supports broadcastable mask.
     """
-    raise NotImplementedError
+    if mask is not None and not isinstance(mask, torch.Tensor):
+        mask = torch.as_tensor(mask, dtype=torch.bool, device=Q.device)
+    elif mask is not None:
+        mask = mask.to(device=Q.device, dtype=torch.bool)
+
+    return scaled_dot_product_attention(Q, K, V, mask=mask)
 
 
 def run_multihead_self_attention(
@@ -165,8 +166,43 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    x = in_features
+    dev, dt = x.device, x.dtype
+    L = x.shape[-2]
 
+    # 权重放到与输入一致的 device/dtype
+    Wq = torch.as_tensor(q_proj_weight, device=dev, dtype=dt)
+    Wk = torch.as_tensor(k_proj_weight, device=dev, dtype=dt)
+    Wv = torch.as_tensor(v_proj_weight, device=dev, dtype=dt)
+    Wo = torch.as_tensor(o_proj_weight, device=dev, dtype=dt)
+
+    # 构造模块（max_seq_len 设为当前序列长度；RoPE 将被中和）
+    mha = MultiheadSelfAttention(
+        d_model=d_model,
+        num_heads=num_heads,
+        max_seq_len=L,
+        theta=1e4,          # 任意值都可以，因为我们会把 positions 置零来中和 RoPE
+        device=dev,
+        dtype=dt,
+    )
+
+    # 加载权重（你的 Linear 参数名为 "W"）
+    state = {
+        "q_proj.W": Wq,
+        "k_proj.W": Wk,
+        "v_proj.W": Wv,
+        "o_proj.W": Wo,
+    }
+    mha.load_state_dict(state, strict=True)
+
+    # 传入全 0 的 position，令 RoPE 变为恒等（cos=1, sin=0）
+    zero_positions = torch.zeros(L, device=dev, dtype=torch.long)  # 形状 (L,)
+
+    mha.eval()
+    with torch.no_grad():
+        out = mha(x, token_positions=zero_positions)
+
+    return out
 
 def run_multihead_self_attention_with_rope(
     d_model: int,
@@ -205,8 +241,45 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    x = in_features
+    dev, dt = x.device, x.dtype
+    L = x.shape[-2]
 
+    # 权重对齐到输入的 device / dtype
+    Wq = torch.as_tensor(q_proj_weight, device=dev, dtype=dt)
+    Wk = torch.as_tensor(k_proj_weight, device=dev, dtype=dt)
+    Wv = torch.as_tensor(v_proj_weight, device=dev, dtype=dt)
+    Wo = torch.as_tensor(o_proj_weight, device=dev, dtype=dt)
+
+    # 构建带 RoPE 的多头自注意力；RoPE 维度 = head_dim = d_model // num_heads（在类中使用）
+    mha = MultiheadSelfAttention(
+        d_model=d_model,
+        num_heads=num_heads,
+        max_seq_len=max_seq_len,
+        theta=theta,
+        device=dev,
+        dtype=dt,
+    )
+
+    # 按参数名加载（你的 Linear 参数名为 "W"）
+    state = {
+        "q_proj.W": Wq,
+        "k_proj.W": Wk,
+        "v_proj.W": Wv,
+        "o_proj.W": Wo,
+    }
+    mha.load_state_dict(state, strict=True)
+
+    # 准备 token 位置；未提供则用 [0..L-1]
+    if token_positions is None:
+        pos = torch.arange(L, device=dev, dtype=torch.long)  # (L,)
+    else:
+        pos = token_positions.to(device=dev, dtype=torch.long)
+
+    mha.eval()
+    with torch.no_grad():
+        out = mha(x, token_positions=pos)   # (..., L, d_model)
+    return out
 
 def run_rope(
     d_k: int,
@@ -294,8 +367,81 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    x = in_features
+    dev, dt = x.device, x.dtype
+    B, L, Din = x.shape
+    assert Din == d_model, f"in_features last dim {Din} != d_model {d_model}"
+    assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
 
+    # 1) 构建模块
+    block = TransformerBlock(
+        d_model=d_model,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        max_seq_len=max_seq_len,
+        theta=theta,
+        device=dev,
+        dtype=dt,
+    )
+
+    # 2) 准备权重（对齐 device/dtype；必要时做转置以匹配 Linear.W 的 (out, in) 约定）
+    def to_dev_dtype(t: Tensor) -> Tensor:
+        return t.to(device=dev, dtype=dt)
+
+    # Attn 投影（Linear.W 形状是 (out, in)=(d_model, d_model)）
+    Wq = to_dev_dtype(weights["attn.q_proj.weight"])
+    Wk = to_dev_dtype(weights["attn.k_proj.weight"])
+    Wv = to_dev_dtype(weights["attn.v_proj.weight"])
+    Wo = to_dev_dtype(weights["attn.output_proj.weight"])
+
+    # LN 权重（RMSNorm.weight 为 (d_model,)）
+    ln1_w = to_dev_dtype(weights["ln1.weight"])
+    ln2_w = to_dev_dtype(weights["ln2.weight"])
+
+    # FFN（三个 Linear：w1: d_model->d_ff；w2: d_ff->d_model；w3: d_model->d_ff）
+    # 我们 Linear.W 为 (out, in)。若提供的形状是反的，就转置。
+    W1 = to_dev_dtype(weights["ffn.w1.weight"])
+    W2 = to_dev_dtype(weights["ffn.w2.weight"])
+    W3 = to_dev_dtype(weights["ffn.w3.weight"])
+
+    def ensure_shape(mat: Tensor, desired: tuple[int, int]) -> Tensor:
+        if mat.shape == desired:
+            return mat
+        elif mat.t().shape == desired:
+            return mat.t()
+        else:
+            raise ValueError(f"FFN weight shape {tuple(mat.shape)} incompatible with {desired}")
+
+    W1 = ensure_shape(W1, (d_ff, d_model))     # w1: (out=d_ff, in=d_model)
+    W2 = ensure_shape(W2, (d_model, d_ff))     # w2: (out=d_model, in=d_ff)
+    W3 = ensure_shape(W3, (d_ff, d_model))     # w3: (out=d_ff, in=d_model)
+
+    # 3) 组装 state_dict（注意我们模块内各层参数名）
+    state = {
+        # LayerNorm (RMSNorm)
+        "input_layernorm.weight": ln1_w,
+        "post_attention_layernorm.weight": ln2_w,
+        # Attention projections
+        "attn.q_proj.W": Wq,
+        "attn.k_proj.W": Wk,
+        "attn.v_proj.W": Wv,
+        "attn.o_proj.W": Wo,
+        # FFN (SwiGLU)
+        "ffn.w1.W": W1,
+        "ffn.w2.W": W2,
+        "ffn.w3.W": W3,
+    }
+    block.load_state_dict(state, strict=True)
+
+    # 4) 准备 RoPE 的 token positions（未提供就用 0..L-1）
+    pos = torch.arange(L, device=dev, dtype=torch.long)
+
+    # 5) 前向
+    block.eval()
+    with torch.no_grad():
+        out = block(x, token_positions=pos)  # (B, L, d_model)
+
+    return out
 
 def run_transformer_lm(
     vocab_size: int,
@@ -376,8 +522,81 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    dev, dt = in_indices.device, torch.float32
 
+    model = TransformerLM(
+        vocab_size=vocab_size,
+        context_length=context_length,
+        num_layers=num_layers,
+        d_model=d_model,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        theta=rope_theta,
+        device=dev,
+        dtype=dt,
+    )
+
+    def td(x: Tensor) -> Tensor:
+        return x.to(device=dev, dtype=dt)
+
+    def fit_linear_weight(mat: Tensor, desired: tuple[int, int]) -> Tensor:
+        if mat.shape == desired:
+            return td(mat)
+        mt = mat.t()
+        if mt.shape == desired:
+            return td(mt)
+        raise ValueError(f"Weight shape {tuple(mat.shape)} incompatible with desired {desired}")
+
+    # ---- 映射并加载除 lm_head 以外的所有参数 ----
+    state: Dict[str, Tensor] = {}
+
+    # token embedding
+    if "token_embeddings.weight" not in weights:
+        raise KeyError("Missing 'token_embeddings.weight' in weights.")
+    state["tok_embeddings.weight"] = td(weights["token_embeddings.weight"])
+
+    # 每层参数
+    for i in range(num_layers):
+        p = f"layers.{i}"
+        state[f"blocks.{i}.input_layernorm.weight"] = td(weights[f"{p}.ln1.weight"])
+        state[f"blocks.{i}.post_attention_layernorm.weight"] = td(weights[f"{p}.ln2.weight"])
+        state[f"blocks.{i}.attn.q_proj.W"] = td(weights[f"{p}.attn.q_proj.weight"])
+        state[f"blocks.{i}.attn.k_proj.W"] = td(weights[f"{p}.attn.k_proj.weight"])
+        state[f"blocks.{i}.attn.v_proj.W"] = td(weights[f"{p}.attn.v_proj.weight"])
+        state[f"blocks.{i}.attn.o_proj.W"] = td(weights[f"{p}.attn.output_proj.weight"])
+        state[f"blocks.{i}.ffn.w1.W"] = fit_linear_weight(weights[f"{p}.ffn.w1.weight"], (d_ff, d_model))
+        state[f"blocks.{i}.ffn.w2.W"] = fit_linear_weight(weights[f"{p}.ffn.w2.weight"], (d_model, d_ff))
+        state[f"blocks.{i}.ffn.w3.W"] = fit_linear_weight(weights[f"{p}.ffn.w3.weight"], (d_ff, d_model))
+
+    # final norm（测试里常叫 ln_final.weight）
+    if "ln_final.weight" in weights:
+        state["final_norm.weight"] = td(weights["ln_final.weight"])
+    elif "final_norm.weight" in weights:
+        state["final_norm.weight"] = td(weights["final_norm.weight"])
+    elif "ln_f.weight" in weights:
+        state["final_norm.weight"] = td(weights["ln_f.weight"])
+
+    # 先加载其余参数
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    missing = set(missing) - {"final_norm.weight"}
+    if missing:
+        raise RuntimeError(f"Missing keys when loading TransformerLM: {sorted(missing)}")
+    if unexpected:
+        raise RuntimeError(f"Unexpected keys when loading TransformerLM: {sorted(unexpected)}")
+
+    # ---- 如果提供了独立 lm_head.weight，则注册为模型参数（否则走共享）----
+    if "lm_head.weight" in weights:
+        # 显式注册为可训练参数；这样 forward 会走独立 head，不与 embedding 共享
+        model.lm_head_weight = torch.nn.Parameter(td(weights["lm_head.weight"]))
+
+    # ---- 前向 ----
+    model.eval()
+    with torch.no_grad():
+        L = in_indices.shape[-1]
+        pos = torch.arange(L, device=dev, dtype=torch.long)
+        logits = model(in_indices, token_positions=pos)  # (B, L, vocab)
+
+    return logits.to(torch.float32)
 
 def run_rmsnorm(
     d_model: int,
@@ -456,7 +675,7 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    return softmax_stable(in_features, dim)
 
 
 def run_cross_entropy(
