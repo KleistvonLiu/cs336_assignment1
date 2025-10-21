@@ -23,12 +23,15 @@ from tests.transformer_block import TransformerBlock
 from tests.transformer_lm import TransformerLM
 from .cross_entrophy import cross_entropy_stable
 from .adamw import AdamWFromScratch
+from .gradient_clipping import clip_gradients
+from .lr_scheduler import lr_cosine_with_warmup
+
 
 def run_linear(
-    d_in: int,
-    d_out: int,
-    weights: Float[Tensor, " d_out d_in"],
-    in_features: Float[Tensor, " ... d_in"],
+        d_in: int,
+        d_out: int,
+        weights: Float[Tensor, " d_out d_in"],
+        in_features: Float[Tensor, " ... d_in"],
 ) -> Float[Tensor, " ... d_out"]:
     """
     Given the weights of a Linear layer, compute the transformation of a batched input.
@@ -50,16 +53,16 @@ def run_linear(
     layer.load_state_dict({"W": W}, strict=True)
 
     # 4) 前向计算
-    layer.eval() # 開啓評估模式，影響dropout和normalization等
+    layer.eval()  # 開啓評估模式，影響dropout和normalization等
     with torch.no_grad():
         return layer(in_features)
 
 
 def run_embedding(
-    vocab_size: int,
-    d_model: int,
-    weights: Float[Tensor, " vocab_size d_model"] | "numpy.ndarray",
-    token_ids: Int[Tensor, " ..."],
+        vocab_size: int,
+        d_model: int,
+        weights: Float[Tensor, " vocab_size d_model"] | "numpy.ndarray",
+        token_ids: Int[Tensor, " ..."],
 ) -> Float[Tensor, " ... d_model"]:
     """
     Given the weights of an Embedding layer, get the embeddings for a batch of token ids.
@@ -90,12 +93,12 @@ def run_embedding(
 
 
 def run_swiglu(
-    d_model: int,
-    d_ff: int,
-    w1_weight: Float[Tensor, " d_ff d_model"],
-    w2_weight: Float[Tensor, " d_model d_ff"],
-    w3_weight: Float[Tensor, " d_ff d_model"],
-    in_features: Float[Tensor, " ... d_model"],
+        d_model: int,
+        d_ff: int,
+        w1_weight: Float[Tensor, " d_ff d_model"],
+        w2_weight: Float[Tensor, " d_model d_ff"],
+        w3_weight: Float[Tensor, " d_ff d_model"],
+        in_features: Float[Tensor, " ... d_model"],
 ) -> Float[Tensor, " ... d_model"]:
     """Given the weights of a SwiGLU network, return the output of your implementation with these weights."""
     dev, dt = in_features.device, in_features.dtype
@@ -120,10 +123,10 @@ def run_swiglu(
 
 
 def run_scaled_dot_product_attention(
-    Q: Float[Tensor, " ... queries d_k"],
-    K: Float[Tensor, " ... keys d_k"],
-    V: Float[Tensor, " ... values d_v"],
-    mask: Bool[Tensor, " ... queries keys"] | None = None,
+        Q: Float[Tensor, " ... queries d_k"],
+        K: Float[Tensor, " ... keys d_k"],
+        V: Float[Tensor, " ... values d_v"],
+        mask: Bool[Tensor, " ... queries keys"] | None = None,
 ) -> Float[Tensor, " ... queries d_v"]:
     """
     Adapter: call your SDPA implementation. Supports broadcastable mask.
@@ -137,13 +140,13 @@ def run_scaled_dot_product_attention(
 
 
 def run_multihead_self_attention(
-    d_model: int,
-    num_heads: int,
-    q_proj_weight: Float[Tensor, " d_k d_in"],
-    k_proj_weight: Float[Tensor, " d_k d_in"],
-    v_proj_weight: Float[Tensor, " d_v d_in"],
-    o_proj_weight: Float[Tensor, " d_model d_v"],
-    in_features: Float[Tensor, " ... sequence_length d_in"],
+        d_model: int,
+        num_heads: int,
+        q_proj_weight: Float[Tensor, " d_k d_in"],
+        k_proj_weight: Float[Tensor, " d_k d_in"],
+        v_proj_weight: Float[Tensor, " d_v d_in"],
+        o_proj_weight: Float[Tensor, " d_model d_v"],
+        in_features: Float[Tensor, " ... sequence_length d_in"],
 ) -> Float[Tensor, " ... sequence_length d_out"]:
     """
     Given the key, query, and value projection weights of a naive unbatched
@@ -182,7 +185,7 @@ def run_multihead_self_attention(
         d_model=d_model,
         num_heads=num_heads,
         max_seq_len=L,
-        theta=1e4,          # 任意值都可以，因为我们会把 positions 置零来中和 RoPE
+        theta=1e4,  # 任意值都可以，因为我们会把 positions 置零来中和 RoPE
         device=dev,
         dtype=dt,
     )
@@ -205,17 +208,18 @@ def run_multihead_self_attention(
 
     return out
 
+
 def run_multihead_self_attention_with_rope(
-    d_model: int,
-    num_heads: int,
-    max_seq_len: int,
-    theta: float,
-    q_proj_weight: Float[Tensor, " d_k d_in"],
-    k_proj_weight: Float[Tensor, " d_k d_in"],
-    v_proj_weight: Float[Tensor, " d_v d_in"],
-    o_proj_weight: Float[Tensor, " d_model d_v"],
-    in_features: Float[Tensor, " ... sequence_length d_in"],
-    token_positions: Int[Tensor, " ... sequence_length"] | None = None,
+        d_model: int,
+        num_heads: int,
+        max_seq_len: int,
+        theta: float,
+        q_proj_weight: Float[Tensor, " d_k d_in"],
+        k_proj_weight: Float[Tensor, " d_k d_in"],
+        v_proj_weight: Float[Tensor, " d_v d_in"],
+        o_proj_weight: Float[Tensor, " d_model d_v"],
+        in_features: Float[Tensor, " ... sequence_length d_in"],
+        token_positions: Int[Tensor, " ... sequence_length"] | None = None,
 ) -> Float[Tensor, " ... sequence_length d_out"]:
     """
     Given the key, query, and value projection weights of a naive unbatched
@@ -279,15 +283,16 @@ def run_multihead_self_attention_with_rope(
 
     mha.eval()
     with torch.no_grad():
-        out = mha(x, token_positions=pos)   # (..., L, d_model)
+        out = mha(x, token_positions=pos)  # (..., L, d_model)
     return out
 
+
 def run_rope(
-    d_k: int,
-    theta: float,
-    max_seq_len: int,
-    in_query_or_key: Float[Tensor, " ... sequence_length d_k"],
-    token_positions: Int[Tensor, " ... sequence_length"],
+        d_k: int,
+        theta: float,
+        max_seq_len: int,
+        in_query_or_key: Float[Tensor, " ... sequence_length d_k"],
+        token_positions: Int[Tensor, " ... sequence_length"],
 ) -> Float[Tensor, " ... sequence_length d_k"]:
     """
     Run RoPE for a given input tensor.
@@ -299,13 +304,13 @@ def run_rope(
 
 
 def run_transformer_block(
-    d_model: int,
-    num_heads: int,
-    d_ff: int,
-    max_seq_len: int,
-    theta: float,
-    weights: dict[str, Tensor],
-    in_features: Float[Tensor, " batch sequence_length d_model"],
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        max_seq_len: int,
+        theta: float,
+        weights: dict[str, Tensor],
+        in_features: Float[Tensor, " batch sequence_length d_model"],
 ) -> Float[Tensor, " batch sequence_length d_model"]:
     """
     Given the weights of a pre-norm Transformer block and input features,
@@ -413,9 +418,9 @@ def run_transformer_block(
         else:
             raise ValueError(f"FFN weight shape {tuple(mat.shape)} incompatible with {desired}")
 
-    W1 = ensure_shape(W1, (d_ff, d_model))     # w1: (out=d_ff, in=d_model)
-    W2 = ensure_shape(W2, (d_model, d_ff))     # w2: (out=d_model, in=d_ff)
-    W3 = ensure_shape(W3, (d_ff, d_model))     # w3: (out=d_ff, in=d_model)
+    W1 = ensure_shape(W1, (d_ff, d_model))  # w1: (out=d_ff, in=d_model)
+    W2 = ensure_shape(W2, (d_model, d_ff))  # w2: (out=d_model, in=d_ff)
+    W3 = ensure_shape(W3, (d_ff, d_model))  # w3: (out=d_ff, in=d_model)
 
     # 3) 组装 state_dict（注意我们模块内各层参数名）
     state = {
@@ -444,16 +449,17 @@ def run_transformer_block(
 
     return out
 
+
 def run_transformer_lm(
-    vocab_size: int,
-    context_length: int,
-    d_model: int,
-    num_layers: int,
-    num_heads: int,
-    d_ff: int,
-    rope_theta: float,
-    weights: dict[str, Tensor],
-    in_indices: Int[Tensor, " batch_size sequence_length"],
+        vocab_size: int,
+        context_length: int,
+        d_model: int,
+        num_layers: int,
+        num_heads: int,
+        d_ff: int,
+        rope_theta: float,
+        weights: dict[str, Tensor],
+        in_indices: Int[Tensor, " batch_size sequence_length"],
 ) -> Float[Tensor, " batch_size sequence_length vocab_size"]:
     """Given the weights of a Transformer language model and input indices,
     return the output of running a forward pass on the input indices.
@@ -599,11 +605,12 @@ def run_transformer_lm(
 
     return logits.to(torch.float32)
 
+
 def run_rmsnorm(
-    d_model: int,
-    eps: float,
-    weights: Float[Tensor, " d_model"] | "numpy.ndarray",
-    in_features: Float[Tensor, " ... d_model"],
+        d_model: int,
+        eps: float,
+        weights: Float[Tensor, " d_model"] | "numpy.ndarray",
+        in_features: Float[Tensor, " ... d_model"],
 ) -> Float[Tensor, " ... d_model"]:
     """
     Given the weights of a RMSNorm affine transform,
@@ -641,7 +648,7 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
 
 
 def run_get_batch(
-    dataset: npt.NDArray, batch_size: int, context_length: int, device: str
+        dataset: npt.NDArray, batch_size: int, context_length: int, device: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Given a dataset (a 1D numpy array of integers) and a desired batch size and
@@ -680,7 +687,7 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
 
 
 def run_cross_entropy(
-    inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]
+        inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]
 ) -> Float[Tensor, ""]:
     """Given a tensor of inputs and targets, compute the average cross-entropy
     loss across examples.
@@ -706,7 +713,7 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    clip_gradients(parameters, max_l2_norm)
 
 
 def get_adamw_cls() -> Any:
@@ -715,12 +722,13 @@ def get_adamw_cls() -> Any:
     """
     return AdamWFromScratch
 
+
 def run_get_lr_cosine_schedule(
-    it: int,
-    max_learning_rate: float,
-    min_learning_rate: float,
-    warmup_iters: int,
-    cosine_cycle_iters: int,
+        it: int,
+        max_learning_rate: float,
+        min_learning_rate: float,
+        warmup_iters: int,
+        cosine_cycle_iters: int,
 ):
     """
     Given the parameters of a cosine learning rate decay schedule (with linear
@@ -740,14 +748,14 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    return lr_cosine_with_warmup(it, max_learning_rate, min_learning_rate, warmup_iters, cosine_cycle_iters)
 
 
 def run_save_checkpoint(
-    model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-    iteration: int,
-    out: str | os.PathLike | BinaryIO | IO[bytes],
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        iteration: int,
+        out: str | os.PathLike | BinaryIO | IO[bytes],
 ):
     """
     Given a model, optimizer, and an iteration number, serialize them to disk.
@@ -763,9 +771,9 @@ def run_save_checkpoint(
 
 
 def run_load_checkpoint(
-    src: str | os.PathLike | BinaryIO | IO[bytes],
-    model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
+        src: str | os.PathLike | BinaryIO | IO[bytes],
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
 ) -> int:
     """
     Given a serialized checkpoint (path or file-like object), restore the
@@ -784,9 +792,9 @@ def run_load_checkpoint(
 
 
 def get_tokenizer(
-    vocab: dict[int, bytes],
-    merges: list[tuple[bytes, bytes]],
-    special_tokens: list[str] | None = None,
+        vocab: dict[int, bytes],
+        merges: list[tuple[bytes, bytes]],
+        special_tokens: list[str] | None = None,
 ) -> Any:
     """Given a vocabulary, a list of merges, and a list of special tokens,
     return a BPE tokenizer that uses the provided vocab, merges, and special tokens.
@@ -805,11 +813,12 @@ def get_tokenizer(
     """
     return Tokenizer(vocab, merges, special_tokens=special_tokens)
 
+
 def run_train_bpe(
-    input_path: str | os.PathLike,
-    vocab_size: int,
-    special_tokens: list[str],
-    **kwargs,
+        input_path: str | os.PathLike,
+        vocab_size: int,
+        special_tokens: list[str],
+        **kwargs,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     """Given the path to an input corpus, run train a BPE tokenizer and
     output its vocabulary and merges.
