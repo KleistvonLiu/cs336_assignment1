@@ -1,0 +1,8 @@
+{
+  "vocab_size": 32000,
+  "num_merges": 31743,
+  "special_tokens": [
+    "<|endoftext|>"
+  ],
+  "human_format": "gpt2"
+}
