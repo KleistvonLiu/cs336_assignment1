@@ -8,7 +8,10 @@ from torch.optim.optimizer import Optimizer
 class AdamWFromScratch(Optimizer):
     r"""
     Pure PyTorch implementation of AdamW (Loshchilov & Hutter, 2019).
-    Decoupled weight decay: p <- p * (1 - lr * wd) - lr * m_hat / (sqrt(v_hat) + eps)
+    Follows the reference AdamW pseudocode:
+      1) update first/second moments
+      2) apply the bias-corrected Adam step
+      3) apply decoupled weight decay
 
     Args:
         params: iterable of parameters
@@ -71,22 +74,24 @@ class AdamWFromScratch(Optimizer):
                 state["step"] += 1
                 t = state["step"]
 
-                # Decoupled weight decay
-                if wd != 0.0:
-                    p.mul_(1.0 - lr * wd)
-
                 # Adam moments
-                exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+                exp_avg = beta1 * exp_avg + (1.0 - beta1) * grad
+                exp_avg_sq = beta2 * exp_avg_sq + (1.0 - beta2) * (grad * grad)
+                state["exp_avg"] = exp_avg
+                state["exp_avg_sq"] = exp_avg_sq
 
-                # Bias correction
+                # Bias-corrected Adam step: alpha_t = lr * sqrt(1 - beta2^t) / (1 - beta1^t)
                 bias_correction1 = 1.0 - beta1 ** t
                 bias_correction2 = 1.0 - beta2 ** t
+                step_size = lr * math.sqrt(bias_correction2) / bias_correction1
+                denom = torch.sqrt(exp_avg_sq) + eps
 
-                denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps) # 这里是吧alpha_t直接带入到公式，同时分子分母都除以自己的bias
-                step_size = lr / bias_correction1
+                # Parameter update: p <- p - step_size * exp_avg / denom
+                update = exp_avg / denom
+                p -= step_size * update
 
-                # Parameter update
-                p.addcdiv_(exp_avg, denom, value=-step_size) # self.addcdiv_(tensor1, tensor2, value=v) 等价于 self = self + tensor1/tensor2 * value
+                # Decoupled weight decay is applied after the Adam step, matching the reference order.
+                if wd != 0.0:
+                    p -= lr * wd * p
 
         return loss

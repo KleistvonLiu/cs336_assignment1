@@ -1,6 +1,6 @@
 # optim/grad_clip.py
 from __future__ import annotations
-from typing import Iterable, Optional
+from typing import Iterable
 import torch
 
 def clip_gradients(params: Iterable[torch.nn.Parameter],
@@ -17,29 +17,27 @@ def clip_gradients(params: Iterable[torch.nn.Parameter],
     Returns:
         total_norm_before_clipping (float)
     """
-    # Collect grads (skip None)
-    grads = [p.grad for p in params if (p.grad is not None)]
+    params = list(params)
+    grads = [p.grad for p in params if p.grad is not None]
     if not grads:
         return 0.0
 
     # Compute global L2 norm in float32 for stability (like PyTorch)
     # Keep the reduction on device to avoid needless transfers.
-    device = grads[0].device
-    total_sq = torch.zeros((), device=device, dtype=torch.float32)
-    for g in grads:
-        total_sq = total_sq + g.detach().to(torch.float32).pow(2).sum()
+    total_sq = torch.zeros((), device=grads[0].device, dtype=torch.float32)
+    for grad in grads:
+        total_sq += grad.detach().to(torch.float32).square().sum()
     total_norm = total_sq.sqrt()  # tensor scalar on device
 
-    # Compute scaling coef
-    if max_norm <= 0:
+    # Compute scaling coefficient. Clip only shrinks gradients; it never scales them up.
+    if max_norm <= 0.0:
         clip_coef = 0.0
     else:
-        clip_coef = float(max_norm) / (float(total_norm.item()) + float(eps))
+        clip_coef = min(1.0, float(max_norm) / (float(total_norm.item()) + float(eps)))
 
-    # Scale in-place only if clipping is needed
+    # Scale in-place only if clipping is needed.
     if clip_coef < 1.0:
-        for p in params:
-            if p.grad is not None:
-                p.grad.mul_(clip_coef)
+        for grad in grads:
+            grad.mul_(clip_coef)
 
     return float(total_norm.item())

@@ -1,73 +1,102 @@
 # decoding.py
 from __future__ import annotations
-from typing import Iterable, Optional, Sequence, List
+
+from typing import List, Optional, Sequence
+
 import torch
 import torch.nn.functional as F
 
+
+def _prepare_prompt_ids(
+    prompt_ids: Sequence[int] | torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    """Normalize prompt ids to shape (1, T) on the requested device."""
+    if isinstance(prompt_ids, torch.Tensor):
+        input_ids = prompt_ids.to(device=device, dtype=torch.long)
+    else:
+        input_ids = torch.tensor(list(prompt_ids), device=device, dtype=torch.long)
+
+    if input_ids.dim() == 1:
+        return input_ids.unsqueeze(0)
+    if input_ids.dim() == 2 and input_ids.size(0) == 1:
+        return input_ids
+
+    raise ValueError("prompt_ids must be 1D or have shape (1, T)")
+
+
+def _apply_top_p(probs: torch.Tensor, top_p: float) -> torch.Tensor:
+    """Keep the smallest high-probability set whose cumulative mass reaches top_p."""
+    if not (0.0 < top_p <= 1.0):
+        raise ValueError(f"top_p must be in (0,1], got {top_p}")
+
+    sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+    # Remove tokens once the cumulative mass is already above the threshold,
+    # but keep the first token that crosses the threshold.
+    remove_sorted = cumulative_probs > top_p
+    remove_sorted[..., 1:] = remove_sorted[..., :-1].clone()
+    remove_sorted[..., 0] = False
+
+    filtered_sorted_probs = sorted_probs.masked_fill(remove_sorted, 0.0)
+    filtered_probs = torch.zeros_like(probs)
+    filtered_probs.scatter_(-1, sorted_indices, filtered_sorted_probs)
+
+    return filtered_probs / filtered_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+def _select_next_token(
+    logits_last: torch.Tensor,
+    temperature: float,
+    top_p: Optional[float],
+) -> torch.Tensor:
+    """Choose the next token from the final-step logits."""
+    if temperature is None or temperature <= 0:
+        return torch.argmax(logits_last, dim=-1, keepdim=True)
+
+    scaled_logits = logits_last / float(temperature)
+    probs = F.softmax(scaled_logits, dim=-1)
+
+    if top_p is not None:
+        probs = _apply_top_p(probs, float(top_p))
+
+    return torch.multinomial(probs, num_samples=1)
+
+
 @torch.no_grad()
 def decode(
-    model,                              # TransformerLM
+    model,  # TransformerLM
     prompt_ids: Sequence[int] | torch.Tensor,
     max_new_tokens: int = 50,
     eos_token_id: Optional[int] = None,
     temperature: float = 1.0,
-    top_p: Optional[float] = None,      # 0<p<=1，None 表示不启用 nucleus
+    top_p: Optional[float] = None,
     device: str | torch.device = "cpu",
 ) -> List[int]:
     """
-    自回归解码：支持 temperature 与 nucleus (top-p) 采样。
-    返回：包含 prompt 与生成内容的完整 token 序列（list[int]）。
+    自回归解码：支持 greedy、temperature 采样和 nucleus (top-p) 采样。
+    返回包含 prompt 与新生成 token 的完整序列。
     """
     model.eval()
-    device = torch.device(device)
-    if isinstance(prompt_ids, torch.Tensor):
-        x = prompt_ids.to(device=device, dtype=torch.long).unsqueeze(0)  # (1,T0) or (B=1,T0)
-    else:
-        x = torch.tensor(list(prompt_ids), dtype=torch.long, device=device).unsqueeze(0)
 
-    # 读取上下文窗口（若类里无该属性，可改为常量或参数传入）
-    ctx_len = getattr(model, "context_length", x.size(1))
+    device = torch.device(device)
+    input_ids = _prepare_prompt_ids(prompt_ids, device=device)
+    context_length = int(getattr(model, "context_length", input_ids.size(1)))
 
     for _ in range(int(max_new_tokens)):
-        # 只保留最近 ctx_len 个 token 作为条件
-        x_cond = x[:, -ctx_len:]
-        logits = model(x_cond)                # (1,T,V)
-        logits_last = logits[:, -1, :]        # (1,V)
+        model_input = input_ids[:, -context_length:]
+        logits = model(model_input)
+        logits_last = logits[:, -1, :]
 
-        # temperature 缩放（<=0 视为贪心）
-        if temperature is None or temperature <= 0:
-            next_id = torch.argmax(logits_last, dim=-1, keepdim=True)  # (1,1)
-        else:
-            logits_last = logits_last / float(temperature)
+        next_token = _select_next_token(
+            logits_last=logits_last,
+            temperature=temperature,
+            top_p=top_p,
+        )
+        input_ids = torch.cat([input_ids, next_token], dim=1)
 
-            # 先做 softmax 得到概率
-            probs = F.softmax(logits_last, dim=-1)  # (1,V)
-
-            # nucleus / top-p
-            if top_p is not None:
-                p = float(top_p)
-                if not (0.0 < p <= 1.0):
-                    raise ValueError(f"top_p must be in (0,1], got {top_p}")
-                # 按概率降序排序
-                sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)   # (1,V), (1,V)
-                cumsum = torch.cumsum(sorted_probs, dim=-1)                              # (1,V)
-                # 保留使累计概率 >= p 的最小集合：keep 首次超出阈值之后的元素置 0
-                # 方式：keep = cumsum <= p；至少保留第一个
-                keep = cumsum <= p
-                keep[..., 0] = True
-                # 反投影到原索引
-                mask = torch.zeros_like(probs, dtype=torch.bool)                         # (1,V)
-                mask.scatter_(-1, sorted_idx, keep)
-                probs = torch.where(mask, probs, torch.zeros_like(probs))
-                probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-
-            # 从分布采样
-            next_id = torch.multinomial(probs, num_samples=1)  # (1,1)
-
-        x = torch.cat([x, next_id], dim=1)
-
-        # 早停：遇到 eos
-        if eos_token_id is not None and int(next_id.item()) == int(eos_token_id):
+        if eos_token_id is not None and int(next_token.item()) == int(eos_token_id):
             break
 
-    return x.squeeze(0).tolist()
+    return input_ids.squeeze(0).tolist()
